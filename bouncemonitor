@@ -1,0 +1,215 @@
+#!/usr/bin/env python2
+import time
+import os
+import sys
+import datetime
+import re
+import logging
+import stat
+import argparse
+
+parser = argparse.ArgumentParser(description='Create stats')
+parser.add_argument("--stat-file", "-s", type=str, required=True)
+parser.add_argument("--lock-file", "-l", type=str, required=True)
+parser.add_argument("--pid-file", "-p", type=argparse.FileType("wb", 0), required=True)
+parser.add_argument("--maillog-file", "-m", type=argparse.FileType("rb", 0), required=True)
+args = parser.parse_args()
+#print args.lock_file
+
+def follow(thefile):
+    thefile.seek(0,2)      # Go to the end of the file
+    sleep = 0.00001
+    while True:
+        line = thefile.readline()
+        if not line:
+            time.sleep(sleep)    # Sleep briefly
+            if sleep < 1.0:
+                sleep += 0.00001
+            continue
+        sleep = 0.00001
+        yield line
+
+history = []
+now = datetime.datetime.now()
+delta = datetime.timedelta(seconds = 1)
+#def notify():
+
+#    print "exceeded threshold"
+
+def touch(fname, times=None):
+    with file(fname, 'a'):
+        os.utime(fname, times)
+
+
+def writePidFile(pidfile):
+    pid = str(os.getpid())
+    pidfile.write(pid)
+    pidfile.close()
+
+writePidFile(args.pid_file)
+
+def updateStatsFile(ratio, num_bounced, num_sent):
+    try:
+        touch(args.lock_file)
+        try:
+            stat_file = open(args.stat_file, "wb")
+            stat_file.write(",".join(map(str,[ratio, num_bounced, num_sent])))
+            stat_file.write("\n")
+            stat_file.close()
+        except IOError:
+            print "Could not create stats file"
+            os.remove(args.lock_file)
+            sys.exit(-1)
+        os.remove(args.lock_file)
+    except IOError:
+        print "Could not create lock file"
+        sys.exit(-1)
+
+
+def checkStats():
+    global now
+    num_sent = sum(s == 'sent' for s in history)
+    num_bounced = sum(b == 'bounced' for b in history)
+    #num_deferred = sum(d == 'deferred' for d in history)
+    divisor = float(num_sent + num_bounced)
+    ratio =0
+    if divisor > 0:
+        ratio = num_bounced / divisor
+    newnow = datetime.datetime.now()
+    if (newnow - now) > delta:
+        updateStatsFile(ratio, num_bounced, num_sent)
+        now = newnow
+    #print now, newnow
+        
+        #if ratio > threshold:
+        #    notify()
+        #else:
+        #    print "not exceeded"
+        #print ratio, threshold
+
+def updateHistory(status):
+    global history
+    history.append(status)
+    history = history[-1000:]
+    if len(history) >= 1000:
+        checkStats()
+
+table_fields = ('id', 'from', 'to', 'relay', 'delay', 'delays',
+        'orig_to', 'dsn', 'message_id', 'size', 'status', 'bounce_message',
+        'timestamp', 'nrcpt', 'client', 'sasl_method', 'sasl_username',
+        'conn_use', 'mailing_id', 'created_at', 'updated_at' )
+
+#logfile = open("maillog")
+logfile = args.maillog_file
+#loglines = follow(logfile)
+loglines = logfile.xreadlines()
+threshold = 1/5.0
+for line in loglines:
+    #print line
+    mailinfo = {}
+    line_parsed = False
+    line = line[:-1] #remove \n character
+
+    #Separate the date and hostname from the rest
+    while line.find('  ') != -1:
+        line = line.replace('  ', ' ')
+    elems = line.split(' ',4)
+    year = datetime.datetime.now().year
+    event_date_str = ("%i %s %s %s" % (year, elems[0], elems[1], elems[2]))
+    event_date = str(datetime.datetime.strptime(event_date_str, "%Y %b %j %H:%M:%S"))
+
+    hostname = elems[3]
+    postfix_details = elems[4]
+    postfix_event = postfix_details.split(':', 2)
+    if len(postfix_event) != 3:
+        #these events are not logged to database (connection information, etc..)
+        pass
+    else:
+        command = postfix_event[0]
+        queue_id = postfix_event[1].strip()
+        details = postfix_event[2]
+        #print details
+
+        if not re.match('[A-Z0-9]{10}', queue_id):
+            #ignore events with an invalid queue_id
+            #print "invalid queue id : " + queue_id
+            continue
+
+        # Create new key based on queue-id if it doesn't exists
+        if not queue_id in mailinfo:
+            mailinfo[queue_id] = {}
+            mailinfo[queue_id]['timestamp'] = event_date
+
+        if details.startswith(' message-id'):
+            message_id = details[13:-1]
+            mailinfo[queue_id]['message_id'] = message_id
+            line_parsed = True
+        if details.startswith(' from=') and command.startswith('postfix/qmgr'):
+            (email_from, size, nrcpt) = details.split(',',3)
+            mailinfo[queue_id]['from'] = email_from[6:]
+            mailinfo[queue_id]['size'] = size[6:]
+            mailinfo[queue_id]['nrcpt'] = nrcpt[7:]
+            line_parsed = True
+        if details.startswith(' to=') and command.startswith('postfix/error'):
+             (email_to, relay, delay, delays, dsn, status) = details.split(',',5)
+             mailinfo[queue_id]['to'] = email_to[5:-1]
+         #mailinfo[queue_id]['to'] = mailinfo[queue_id]['to'][:2]
+             mailinfo[queue_id]['relay'] = relay[7:]
+             mailinfo[queue_id]['delay'] = delay[7:]
+             mailinfo[queue_id]['delays'] = delays[8:]
+             mailinfo[queue_id]['dsn'] = dsn[5:]
+             mailinfo[queue_id]['status'] = status[8:]
+             #print mailinfo
+             line_parsed = True
+        #Ignore useless postfix commands
+        if details.startswith(' removed') and command.startswith('postfix/qmgr'):
+            pass #Ignore this line
+            line_parsed = True
+        if details.startswith(' uid') and command.startswith('postfix/pickup'):
+            pass #Ignore this line
+            line_parsed = True
+
+        if command.startswith('postfix/smtp') or command.startswith('postfix/local'):
+            elems = details.split(', ')
+            if len(elems) > 1:
+                for elem in elems:
+                    index = elem.find('=')
+                    key = elem[0:index].strip()
+                    val = elem[index+1:].strip()
+                    if key in table_fields:
+                        mailinfo[queue_id][key] = val
+                    else:
+                        #print 'invalid key : ' + key
+                        pass
+            line_parsed = True
+        if command.startswith("postfix/bounce"):
+            mailinfo[queue_id]['bounce_message'] = details.strip()
+            line_parsed = True
+
+        #rename reserved mysql keywords
+        if 'status' in mailinfo[queue_id]:
+            mailinfo[queue_id]['status_'] = mailinfo[queue_id]['status']
+            del mailinfo[queue_id]['status']
+        if 'from' in mailinfo[queue_id]:
+            mailinfo[queue_id]['from_'] = mailinfo[queue_id]['from']
+            del mailinfo[queue_id]['from']
+        if 'to' in mailinfo[queue_id]:
+            mailinfo[queue_id]['to_'] = mailinfo[queue_id]['to']
+            del mailinfo[queue_id]['to']
+
+        #print unparsed lines
+        if not line_parsed:
+            #print postfix_event
+            pass
+        if 'status_' in mailinfo[queue_id]:
+            if mailinfo[queue_id]['status_'].startswith('sent'):
+                updateHistory('sent')
+            elif mailinfo[queue_id]['status_'].startswith('bounced'):
+                updateHistory('bounced')
+            elif mailinfo[queue_id]['status_'].startswith('deferred'):
+                #update_history('deferred')
+                pass
+        #print sent, bounced, deferred
+
+
+

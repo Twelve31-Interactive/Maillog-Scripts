@@ -1,0 +1,52 @@
+#!/usr/bin/env python2
+import time
+import os
+import sys
+import argparse
+import errno
+
+parser = argparse.ArgumentParser(description='Read status')
+parser.add_argument("--stat-file", "-s", type=str, required=True)
+parser.add_argument("--lock-file", "-l", type=str, required=True)
+args = parser.parse_args()
+
+warning = .2
+critical = .4
+
+def isLocked():
+    try:
+        lock_file = open(args.lock_file)
+        lock_file.close()
+        return True
+    except IOError as e:
+    	if e.errno == errno.EACCES:
+    		return True
+    return False
+
+def checkStats():
+    while True:
+        if not isLocked():
+            try:
+                stat_file = open(args.stat_file)
+                stats = stat_file.readline().split(",", 3)
+                stat_file.close()
+                ratio, num_bounced, num_sent = stats[0], stats[1], stats[2]
+                if float(ratio) > critical:
+                    print "BOUNCE RATE CRITICAL: %s%%" % (float(ratio) * 100.0)
+                    sys.exit(2)
+                elif float(ratio) > warning:
+                    print "BOUNCE RATE WARNING: %s%%" % (float(ratio) * 100.0)
+                    sys.exit(1)
+                else:
+                    print "BOUNCE RATE OK: %s%%" % (float(ratio) * 100.0)
+                    sys.exit(0)
+
+                #print ratio, num_bounced, num_sent, threshold
+            except IOError:
+                print "Could not open stats file"
+                sys.exit(-1)
+            break
+        else:
+            time.sleep(.1)
+
+checkStats()
